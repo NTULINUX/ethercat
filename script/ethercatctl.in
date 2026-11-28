@@ -103,10 +103,11 @@ parse_mac_address() {
 }
 
 #------------------------------------------------------------------------------
-# Print the PCI address of the network interface with MAC address $1
+# Print the bus and device name ("pci:0000:18:00.0", "platform:fd580000.ethernet")
+# of the network interface with MAC address $1
 
-mac_to_pci_addr() {
-    local want addr_file dev cur_mac
+mac_to_bus_dev() {
+    local want addr_file dev cur_mac bus
 
     want="${1,,}"
     [[ -z "${want}" ]] && return 1
@@ -117,7 +118,8 @@ mac_to_pci_addr() {
         if [[ "${cur_mac,,}" = "${want}" ]]; then
             dev="$(dirname "${addr_file}")/device"
             [[ -e "${dev}" ]] || continue  # skip virtual interfaces
-            basename "$(readlink -f "${dev}")"
+            bus=$(basename "$(readlink -f "${dev}/subsystem")")
+            printf '%s:%s\n' "${bus}" "$(basename "$(readlink -f "${dev}")")"
             return 0
         fi
     done
@@ -126,25 +128,27 @@ mac_to_pci_addr() {
 }
 
 #------------------------------------------------------------------------------
-# Unbind those PCI devices in the address list $2... that are currently bound
+# Unbind those devices in the "bus:name" list $2... that are currently bound
 # to standard module $1. Devices bound to other modules (other NIC types) are
 # skipped. The standard module stays loaded, so all other devices keep their
-# driver. Unbound addresses are appended to the CLAIMED_PCI array.
+# driver. Unbound devices are appended to the CLAIMED_DEVS array.
 # Returns 0 if devices were unbound, 2 if none matched, 1 on error.
 
-unbind_pci_devices() {
-    local stdmod addr dev cur rc
+unbind_bus_devices() {
+    local stdmod entry bus name dev cur rc
 
     stdmod="${1//-/_}"
     shift
     rc=2
 
-    for addr in "$@"; do
-        dev="/sys/bus/pci/devices/${addr}"
+    for entry in "$@"; do
+        bus="${entry%%:*}"
+        name="${entry#*:}"
+        dev="/sys/bus/${bus}/devices/${name}"
         cur=$(basename "$(readlink -f "${dev}/driver/module" 2>/dev/null)")
         [[ "${cur}" = "${stdmod}" ]] || continue
-        printf '%s\n' "${addr}" > "${dev}/driver/unbind" || return 1
-        CLAIMED_PCI+=("${addr}")
+        printf '%s\n' "${name}" > "${dev}/driver/unbind" || return 1
+        CLAIMED_DEVS+=("${entry}")
         rc=0
     done
 
@@ -152,27 +156,33 @@ unbind_pci_devices() {
 }
 
 #------------------------------------------------------------------------------
-# Ask the kernel to probe the PCI devices in the address list $@ again, so
-# that a loaded standard driver can claim them
+# Ask the kernel to probe the devices in the "bus:name" list $@ again, so
+# that a loaded standard driver can claim them. Devices that failed are stored
+# in the REPROBE_FAILED array. Returns 1 if any device failed.
 
-reprobe_pci_devices() {
-    local addr
-    for addr in "$@"; do
-        echo "${addr}" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+reprobe_bus_devices() {
+    local entry rc=0
+    REPROBE_FAILED=()
+    for entry in "$@"; do
+        if ! echo "${entry#*:}" 2>/dev/null > "/sys/bus/${entry%%:*}/drivers_probe"; then
+            REPROBE_FAILED+=("${entry}")
+            rc=1
+        fi
     done
+    return "${rc}"
 }
 
 #------------------------------------------------------------------------------
-# Print the PCI addresses of all devices currently bound to module $1
+# Print the "bus:name" of all devices currently bound to module $1
 
-module_pci_devices() {
-    local entry addr
-    for entry in /sys/module/"$1"/drivers/pci:*/*; do
+module_bus_devices() {
+    local entry name drv
+    for entry in /sys/module/"${1//-/_}"/drivers/*:*/*; do
         [[ -L "${entry}" ]] || continue
-        addr=$(basename "${entry}")
-        case "${addr}" in
-            [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:*) echo "${addr}" ;;
-        esac
+        name=$(basename "${entry}")
+        [[ "${name}" != "module" ]] || continue
+        drv=$(basename "$(dirname "${entry}")")
+        printf '%s:%s\n' "${drv%%:*}" "${name}"
     done
 }
 
@@ -189,7 +199,8 @@ start)
     # construct DEVICES and BACKUPS from configuration variables
     DEVICES=""
     BACKUPS=""
-    ECAT_PCI_ADDRS=()
+    ECAT_DEVS=()
+    ALL_COVERED=1
     MASTER_INDEX=0
 
     while true; do
@@ -204,13 +215,23 @@ start)
 
         parse_mac_address "${DEVICE}"
         DEVICES="${DEVICES}${MAC}"
-        PCI_ADDR=$(mac_to_pci_addr "${MAC}" || true)
-        if [[ -n "${PCI_ADDR}" ]]; then ECAT_PCI_ADDRS+=("${PCI_ADDR}"); fi
+        BUS_DEV=$(mac_to_bus_dev "${MAC}" || true)
+        if [[ -n "${BUS_DEV}" ]]; then
+            ECAT_DEVS+=("${BUS_DEV}")
+        else
+            ALL_COVERED=0
+        fi
 
         parse_mac_address "${BACKUP}"
         BACKUPS="${BACKUPS}${MAC}"
-        PCI_ADDR=$(mac_to_pci_addr "${MAC}" || true)
-        if [[ -n "${PCI_ADDR}" ]]; then ECAT_PCI_ADDRS+=("${PCI_ADDR}"); fi
+        if [[ -n "${MAC}" ]]; then
+            BUS_DEV=$(mac_to_bus_dev "${MAC}" || true)
+            if [[ -n "${BUS_DEV}" ]]; then
+                ECAT_DEVS+=("${BUS_DEV}")
+            else
+                ALL_COVERED=0
+            fi
+        fi
 
         MASTER_INDEX=$((MASTER_INDEX + 1))
     done
@@ -247,12 +268,12 @@ start)
         fi
 
         UNBOUND=0
-        CLAIMED_PCI=()
+        CLAIMED_DEVS=()
         if [[ "${MODULE}" != "generic" ]]; then
             STDMODULE=$(std_module_name "${MODULE}")
             CLAIM_RC=1
-            if [[ "${#ECAT_PCI_ADDRS[@]}" -gt 0 ]]; then
-                unbind_pci_devices "${STDMODULE}" "${ECAT_PCI_ADDRS[@]}"
+            if [[ "${ALL_COVERED}" -eq 1 ]]; then
+                unbind_bus_devices "${STDMODULE}" "${ECAT_DEVS[@]}"
                 CLAIM_RC=$?
             fi
             case "${CLAIM_RC}" in
@@ -267,9 +288,9 @@ start)
                     UNBOUND=1
                     ;;
                 *)
-                    # Fallback (no PCI device or unbinding failed): hand back
+                    # Fallback (a configured device was not found or unbinding failed): hand back
                     # anything unbound, then replace the standard module as before.
-                    reprobe_pci_devices "${CLAIMED_PCI[@]}"
+                    reprobe_bus_devices "${CLAIMED_DEVS[@]}"
                     # unload standard module and check if unloading was successful
                     "${RMMOD}" "${STDMODULE}" 2> /dev/null || true
                     if "${LSMOD}" | grep -q "^${STDMODULE//-/_} "; then
@@ -283,7 +304,7 @@ start)
 
         if ! "${MODPROBE}" "${MODPROBE_FLAGS_ARR[@]}" "${ECMODULE}"; then
             if [[ "${UNBOUND}" -eq 1 ]]; then
-                reprobe_pci_devices "${CLAIMED_PCI[@]}" # hand NICs back
+                reprobe_bus_devices "${CLAIMED_DEVS[@]}" # hand NICs back
             elif [[ "${MODULE}" != "generic" ]]; then
                 "${MODPROBE}" "${MODPROBE_FLAGS_ARR[@]}" "${STDMODULE}" # try to restore
             fi
@@ -300,19 +321,20 @@ start)
 #------------------------------------------------------------------------------
 
 stop)
+    PENDING_DEVS=()
     # unload EtherCAT device modules
     for MODULE in "${DEVICE_MODULES_ARR[@]}" master; do
         ECMODULE="ec_${MODULE}"
         if ! "${LSMOD}" | grep -q "^${ECMODULE//-/_} "; then
             continue # ec_* module not loaded
         fi
-        mapfile -t ECAT_PCI_BOUND < <(module_pci_devices "${ECMODULE}")
+        mapfile -t ECAT_DEVS_BOUND < <(module_bus_devices "${ECMODULE}")
         if ! "${RMMOD}" "${ECMODULE}"; then
             exit 1
         fi
         # The standard module may still be loaded, so it will not pick the
         # released NICs up by itself: probe them explicitly.
-        reprobe_pci_devices "${ECAT_PCI_BOUND[@]}"
+        reprobe_bus_devices "${ECAT_DEVS_BOUND[@]}" || PENDING_DEVS+=("${REPROBE_FAILED[@]}")
     done
 
     sleep 1
@@ -325,12 +347,20 @@ stop)
         "${MODPROBE}" "${MODPROBE_FLAGS_ARR[@]}" "$(std_module_name "${MODULE}")"
     done
 
+    STOP_RC=0
+    if ! reprobe_bus_devices "${PENDING_DEVS[@]}"; then
+        for entry in "${REPROBE_FAILED[@]}"; do
+            printf '%s\n' "ERROR: could not re-probe ${entry}" >&2
+        done
+        STOP_RC=1
+    fi
+
     # bring down all updown interfaces
     for interface in "${UPDOWN_ARR[@]}"; do
         "${IP}" link set dev "${interface}" down
     done
 
-    exit 0
+    exit "${STOP_RC}"
     ;;
 
 #------------------------------------------------------------------------------
